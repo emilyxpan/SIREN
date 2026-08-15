@@ -41,6 +41,8 @@ from .detector import GeometryPosition, GeometryDirection
 from .errors import ConfigurationError
 from .math import Vector3D
 
+from tqdm import tqdm
+
 
 # PDG codes for parent mesons
 PTYPE_PIPLUS = 211
@@ -396,85 +398,140 @@ def read_dk2nu(
     have_time = read_time
     total_pot = 0.0
 
-    for fname in filenames:
-        f = uproot.open(fname)
-        if "dk2nuTree" not in [k.split(";")[0] for k in f.keys()]:
-            continue
-        tree = f["dk2nuTree"]
-        branches = _detect_branches(tree)
+    print("Reading files now")
+    for fname in tqdm(filenames, desc="Reading dk2nu", unit="file",):
+        with uproot.open(fname, num_workers=4, array_cache=None) as f:
+            if "dk2nuTree" not in [k.split(";")[0] for k in f.keys()]:
+                continue
+            tree = f["dk2nuTree"]
+            branches = _detect_branches(tree)
 
-        kw = {}
-        if entry_start is not None:
-            kw["entry_start"] = entry_start
-        if entry_stop is not None:
-            kw["entry_stop"] = entry_stop
+            kw = {}
+            if entry_start is not None:
+                kw["entry_start"] = entry_start
+            if entry_stop is not None:
+                kw["entry_stop"] = entry_stop
 
-        data = tree.arrays(
-            list(branches.values()),
-            library="np",
-            **kw,
-        )
+            # Read this ROOT file in chunks instead of loading the whole tree.
+            #
+            # "100 MB" controls approximately how much ROOT data uproot reads
+            # for each iteration. You can lower this to "50 MB" if RAM is tight.
+            for data, report in tree.iterate(
+                list(branches.values()),
+                library="np",
+                step_size="500 MB",
+                report=True,
+                **kw,
+            ):
+                columns = {
+                    "ptype": data[branches["ptype"]].astype(int),
+                    "E": data[branches["ppenergy"]],
+                    "px": data[branches["pdpx"]],
+                    "py": data[branches["pdpy"]],
+                    "pz": data[branches["pdpz"]],
+                    "vx": data[branches["vx"]],
+                    "vy": data[branches["vy"]],
+                    "vz": data[branches["vz"]],
+                    "nimpwt": data[branches["nimpwt"]],
+                    "ntype": data[branches["ntype"]].astype(int),
+                    "ndecay": data[branches["ndecay"]].astype(int),
+                }
 
-        columns = {
-            "ptype": data[branches["ptype"]].astype(int),
-            "E": data[branches["ppenergy"]],
-            "px": data[branches["pdpx"]],
-            "py": data[branches["pdpy"]],
-            "pz": data[branches["pdpz"]],
-            "vx": data[branches["vx"]],
-            "vy": data[branches["vy"]],
-            "vz": data[branches["vz"]],
-            "nimpwt": data[branches["nimpwt"]],
-            "ntype": data[branches["ntype"]].astype(int),
-            "ndecay": data[branches["ndecay"]].astype(int),
-        }
-        if read_polarization:
-            columns.update(_muon_polarization(data, branches))
+                if read_polarization:
+                    columns.update(_muon_polarization(data, branches))
 
-        mask = np.ones(len(columns["ptype"]), dtype=bool)
-        if parent_pdg is not None:
-            mask &= np.isin(columns["ptype"], parent_pdg)
-        if decay_modes is not None:
-            mask &= np.isin(columns["ndecay"], decay_modes)
-        if nu_pdg is not None:
-            mask &= np.isin(columns["ntype"], nu_pdg)
+                # ----------------------------------------------------------
+                # Apply filters immediately, while this chunk is small.
+                # ----------------------------------------------------------
+                mask = np.ones(len(columns["ptype"]), dtype=bool)
 
-        if have_time:
-            anc = None
-            tree_keys = set(tree.keys())
-            for aset in _ANCESTOR_SETS:
-                if all(v in tree_keys for v in aset.values()):
-                    anc = aset
-                    break
-            if anc is None:
-                print("  %s carries no ancestor branches; production "
-                      "times unavailable" % fname)
-                have_time = False
-            else:
-                arr = tree.arrays(list(anc.values()), library="ak", **kw)
-                last_pdg = np.asarray(arr[anc["pdg"]][:, -1], dtype=int)
-                last_t = np.asarray(arr[anc["startt"]][:, -1], dtype=float)
-                mask &= last_pdg == columns["ntype"]
-                columns["t0"] = last_t
+                if parent_pdg is not None:
+                    mask &= np.isin(columns["ptype"], parent_pdg)
 
-        for k, v in columns.items():
-            all_data[k].append(v[mask])
+                if decay_modes is not None:
+                    mask &= np.isin(columns["ndecay"], decay_modes)
 
-        # uproot method to get total POT from dkmetaTree (if available)
-        if "dkmetaTree" in f:
-            meta_tree = f["dkmetaTree"]
-            if "dkmeta/pots" in meta_tree.keys():
-                pots = meta_tree["dkmeta/pots"].array(library="np")
-                if len(pots) > 0:
-                    pots = pots[0]
-                else:
-                    pots = 0.0
-                total_pot += pots
+                if nu_pdg is not None:
+                    mask &= np.isin(columns["ntype"], nu_pdg)
+
+                # ----------------------------------------------------------
+                # Ancestor/time information.
+                #
+                # Only read ancestor rows corresponding to THIS chunk,
+                # rather than reading ancestors for the entire ROOT file.
+                # ----------------------------------------------------------
+                if have_time:
+                    anc = None
+                    tree_keys = set(tree.keys())
+
+                    for aset in _ANCESTOR_SETS:
+                        if all(v in tree_keys for v in aset.values()):
+                            anc = aset
+                            break
+
+                    if anc is None:
+                        print(
+                            "  %s carries no ancestor branches; production "
+                            "times unavailable" % fname
+                        )
+                        have_time = False
+
+                    else:
+                        arr = tree.arrays(
+                            list(anc.values()),
+                            library="ak",
+                            entry_start=report.tree_entry_start,
+                            entry_stop=report.tree_entry_stop,
+                        )
+
+                        last_pdg = np.asarray(
+                            arr[anc["pdg"]][:, -1],
+                            dtype=int,
+                        )
+
+                        last_t = np.asarray(
+                            arr[anc["startt"]][:, -1],
+                            dtype=float,
+                        )
+
+                        mask &= last_pdg == columns["ntype"]
+                        columns["t0"] = last_t
+
+                # ----------------------------------------------------------
+                # Only retain rows that survive the filters.
+                # The large unfiltered chunk disappears on the next iteration.
+                # ----------------------------------------------------------
+                for k, v in columns.items():
+                    all_data[k].append(v[mask])
+
+            # uproot method to get total POT from dkmetaTree (if available)
+            if "dkmetaTree" in f:
+                meta_tree = f["dkmetaTree"]
+                if "dkmeta/pots" in meta_tree.keys():
+                    pots = meta_tree["dkmeta/pots"].array(library="np")
+                    if len(pots) > 0:
+                        pots = pots[0]
+                    else:
+                        pots = 0.0
+                    total_pot += pots
 
     if not have_time:
         all_data.pop("t0", None)
-    result = {k: np.concatenate(v) if v else np.array([])
-              for k, v in all_data.items()}
+    result = {}
+
+    for k in list(all_data.keys()):
+        # Remove this column's chunks from all_data first.
+        parts = all_data.pop(k)
+
+        if parts:
+            result[k] = np.concatenate(parts)
+        else:
+            result[k] = np.array([])
+
+        # Release the old chunk arrays for this column
+        # before concatenating the next column.
+        del parts
+        
     result["pot"] = total_pot
     return result
 
@@ -646,47 +703,90 @@ def dk2nu_to_primary_distribution(
             "detector-local.")
 
     ptype = dk2nu_data["ptype"]
+
+    simulated_pot = dk2nu_data["pot"]
+
+    if not (simulated_pot > 0):
+        raise ConfigurationError(
+            "dk2nu_data['pot'] is %r; a positive simulated POT is required"
+            % simulated_pot
+        )
+
+    # ------------------------------------------------------------
+    # Determine whether we ACTUALLY need to filter.
+    # Do not boolean-index mmap arrays when every row is retained.
+    # ------------------------------------------------------------
+    mask = None
+
     if parent_pdg is not None:
         if not hasattr(parent_pdg, "__iter__"):
             parent_pdg = [parent_pdg]
+
         mask = np.isin(ptype, parent_pdg)
-    else:
-        mask = np.ones(len(ptype), dtype=bool)
 
-    simulated_pot = dk2nu_data["pot"]
-    # Per-POT weights are meaningless without a positive POT. read_dk2nu leaves
-    # pot at 0.0 when a file has no dkmetaTree/pots branch; dividing by it would
-    # emit inf/nan weights silently. Fail loud at the point the weights are
-    # formed rather than propagate a corrupt distribution.
-    if not (simulated_pot > 0):
-        raise ConfigurationError(
-            "dk2nu_data['pot'] is %r; a positive simulated POT is required to "
-            "compute per-POT weights. The input file(s) carried no POT metadata "
-            "(no dkmetaTree/pots branch)." % (simulated_pot,))
-
-    # G4BNB EXP importance reweighting occasionally emits rows with a
-    # negative nimpwt (a bookkeeping artifact of the reweighting, not a
-    # physical parent count). The engine rejects negative physical row
-    # weights loudly, so drop such rows here with a notice; their weight
-    # total is negligible by construction.
     all_nimpwt = dk2nu_data["nimpwt"]
-    bad = ~np.isfinite(all_nimpwt) | (all_nimpwt < 0)
-    if np.any(bad & mask):
-        print("  dropping %d row(s) with negative or non-finite nimpwt "
-              "(importance-reweighting bookkeeping artifacts)"
-              % int(np.sum(bad & mask)))
-        mask = mask & ~bad
 
-    E = dk2nu_data["E"][mask]
-    px = dk2nu_data["px"][mask]
-    py = dk2nu_data["py"][mask]
-    pz = dk2nu_data["pz"][mask]
-    vx = dk2nu_data["vx"][mask]
-    vy = dk2nu_data["vy"][mask]
-    vz = dk2nu_data["vz"][mask]
-    nimpwt = dk2nu_data["nimpwt"][mask]
-    pt = ptype[mask]
-    t0 = dk2nu_data["t0"][mask] if "t0" in dk2nu_data else None
+    bad = (
+        ~np.isfinite(all_nimpwt)
+        | (all_nimpwt < 0)
+    )
+
+    n_bad = int(np.count_nonzero(bad))
+
+    if n_bad:
+        print(
+            f"  found {n_bad} row(s) with negative or non-finite nimpwt",
+            flush=True,
+        )
+
+        if mask is None:
+            mask = ~bad
+        else:
+            mask &= ~bad
+
+
+    # ------------------------------------------------------------
+    # IMPORTANT:
+    # If no filtering is necessary, use mmap arrays DIRECTLY.
+    # No giant copies.
+    # ------------------------------------------------------------
+    if mask is None:
+        E = dk2nu_data["E"]
+        px = dk2nu_data["px"]
+        py = dk2nu_data["py"]
+        pz = dk2nu_data["pz"]
+
+        vx = dk2nu_data["vx"]
+        vy = dk2nu_data["vy"]
+        vz = dk2nu_data["vz"]
+
+        nimpwt = dk2nu_data["nimpwt"]
+        pt = ptype
+
+        t0 = (
+            dk2nu_data["t0"]
+            if "t0" in dk2nu_data
+            else None
+        )
+
+    else:
+        E = dk2nu_data["E"][mask]
+        px = dk2nu_data["px"][mask]
+        py = dk2nu_data["py"][mask]
+        pz = dk2nu_data["pz"][mask]
+
+        vx = dk2nu_data["vx"][mask]
+        vy = dk2nu_data["vy"][mask]
+        vz = dk2nu_data["vz"][mask]
+
+        nimpwt = dk2nu_data["nimpwt"][mask]
+        pt = ptype[mask]
+
+        t0 = (
+            dk2nu_data["t0"][mask]
+            if "t0" in dk2nu_data
+            else None
+        )
 
     # Muon spin axes ride along as pol_x/y/z columns (and from there into
     # each record's interaction parameters) when any selected row carries
@@ -708,16 +808,9 @@ def dk2nu_to_primary_distribution(
         13: 0.10566,     -13: 0.10566,
     }
 
-    # Map the file's coordinates into the frame the transform targets:
-    # positions (after cm -> m) pick up the rotation and translation,
-    # momenta and spin axes the rotation alone. The default transform is
-    # the identity into the geometry frame.
-    pos_m = np.stack([vx, vy, vz], axis=1) * 0.01
-    mom = np.stack([px, py, pz], axis=1)
-    pos_m = pos_m @ xform.rotation.T + xform.translation
-    mom = mom @ xform.rotation.T
-    if pol is not None:
-        pol = pol @ xform.rotation.T
+    # Map the file's coordinates into the frame the transform targets.
+    # Do this in bounded chunks so we never materialize full (N, 3)
+    # position and momentum arrays for the entire dk2nu sample.
     to_detector = xform.target == "detector"
 
     # The decay time from the ancestor chain becomes the primary's initial
@@ -728,61 +821,129 @@ def dk2nu_to_primary_distribution(
         keys.append("t0")
     if pol is not None:
         keys += ["pol_x", "pol_y", "pol_z"]
-    data = []
-    for i in range(len(E)):
-        # Convert position from geometry to detector coordinates, unless
-        # the frame transform already landed in detector coordinates.
-        if to_detector:
-            x_det = (float(pos_m[i][0]), float(pos_m[i][1]),
-                     float(pos_m[i][2]))
-        else:
-            geo_pos = GeometryPosition(Vector3D(*pos_m[i]))
-            det_pos = detector_model.GeoPositionToDetPosition(geo_pos).get()
-            x_det = (det_pos.GetX(), det_pos.GetY(), det_pos.GetZ())
 
-        # Convert momentum direction from geometry to detector coordinates.
-        # Energy is a scalar and is unchanged; the 3-momentum direction
-        # must be rotated if the detector axes differ from geometry axes.
-        p_mag = math.sqrt(float(mom[i][0])**2 + float(mom[i][1])**2
-                          + float(mom[i][2])**2)
-        if to_detector or p_mag == 0.0:
-            px_det, py_det, pz_det = (float(mom[i][0]), float(mom[i][1]),
-                                      float(mom[i][2]))
-        else:
-            geo_dir = GeometryDirection(Vector3D(
-                float(mom[i][0]) / p_mag, float(mom[i][1]) / p_mag,
-                float(mom[i][2]) / p_mag))
-            det_dir = detector_model.GeoDirectionToDetDirection(geo_dir).get()
-            px_det = det_dir.GetX() * p_mag
-            py_det = det_dir.GetY() * p_mag
-            pz_det = det_dir.GetZ() * p_mag
+    n_rows = len(E)
+    data = np.empty((n_rows, len(keys)), dtype=np.float64)
 
-        m = mass_map.get(int(pt[i]), 0.13957)
-        # dk2nu stores momentum at decay (pdpx/pdpy/pdpz) but energy
-        # at production (ppenergy). Compute on-shell energy from the
-        # decay-point momentum and known mass.
-        E_decay = math.sqrt(p_mag * p_mag + m * m)
-        row = [
-            E_decay, px_det, py_det, pz_det,
-            x_det[0], x_det[1], x_det[2],
-            m, float(weight[i]),
-        ]
-        if t0 is not None:
-            row.append(float(t0[i]))
+    # 250k rows means each float64 (N, 3) temporary is about 6 MB.
+    # Increase this for more speed or decrease it if memory is still tight.
+    transform_chunk_size = 250_000
+    n_chunks = (n_rows + transform_chunk_size - 1) // transform_chunk_size
+
+    for chunk_idx, start in enumerate(
+            range(0, n_rows, transform_chunk_size), start=1):
+        stop = min(start + transform_chunk_size, n_rows)
+
+        # Materialize only this slice of positions and momenta.
+        pos_chunk = np.column_stack((
+            vx[start:stop],
+            vy[start:stop],
+            vz[start:stop],
+        )).astype(np.float64, copy=False)
+        pos_chunk *= 0.01  # cm -> m
+
+        mom_chunk = np.column_stack((
+            px[start:stop],
+            py[start:stop],
+            pz[start:stop],
+        )).astype(np.float64, copy=False)
+
+        # Apply the rigid file-frame transform only to this chunk.
+        pos_chunk = (
+            pos_chunk @ xform.rotation.T
+            + xform.translation
+        )
+        mom_chunk = mom_chunk @ xform.rotation.T
+
+        # Polarization is normally absent for the pion sample used by this
+        # script. If present, transform only the matching slice here rather
+        # than creating another transformed full-size array.
         if pol is not None:
-            # The spin axis is a rest-frame direction expressed in the
-            # file's spatial basis; rotate it like the momentum (all these
-            # frames are related by rotations and pure boosts, which share
-            # their spatial bases).
-            norm = float(np.linalg.norm(pol[i]))
-            if to_detector or norm == 0.0:
-                row += [float(pol[i][0]), float(pol[i][1]), float(pol[i][2])]
+            pol_chunk = pol[start:stop] @ xform.rotation.T
+        else:
+            pol_chunk = None
+
+        if chunk_idx == 1 or chunk_idx % 10 == 0 or chunk_idx == n_chunks:
+            print(
+                "  transforming dk2nu rows %d-%d / %d (%.1f%%)"
+                % (start, stop, n_rows, 100.0 * stop / n_rows),
+                flush=True,
+            )
+
+        for local_i in range(stop - start):
+            i = start + local_i
+
+            # Convert position from geometry to detector coordinates, unless
+            # the frame transform already landed in detector coordinates.
+            if to_detector:
+                x_det = (
+                    float(pos_chunk[local_i, 0]),
+                    float(pos_chunk[local_i, 1]),
+                    float(pos_chunk[local_i, 2]),
+                )
             else:
-                geo_ax = GeometryDirection(Vector3D(*(pol[i] / norm)))
-                det_ax = detector_model.GeoDirectionToDetDirection(geo_ax).get()
-                row += [det_ax.GetX() * norm, det_ax.GetY() * norm,
-                        det_ax.GetZ() * norm]
-        data.append(row)
+                geo_pos = GeometryPosition(Vector3D(*pos_chunk[local_i]))
+                det_pos = detector_model.GeoPositionToDetPosition(geo_pos).get()
+                x_det = (det_pos.GetX(), det_pos.GetY(), det_pos.GetZ())
+
+            # Convert momentum direction from geometry to detector coordinates.
+            p0 = float(mom_chunk[local_i, 0])
+            p1 = float(mom_chunk[local_i, 1])
+            p2 = float(mom_chunk[local_i, 2])
+            p_mag = math.sqrt(p0 * p0 + p1 * p1 + p2 * p2)
+
+            if to_detector or p_mag == 0.0:
+                px_det, py_det, pz_det = p0, p1, p2
+            else:
+                geo_dir = GeometryDirection(Vector3D(
+                    p0 / p_mag,
+                    p1 / p_mag,
+                    p2 / p_mag,
+                ))
+                det_dir = detector_model.GeoDirectionToDetDirection(geo_dir).get()
+                px_det = det_dir.GetX() * p_mag
+                py_det = det_dir.GetY() * p_mag
+                pz_det = det_dir.GetZ() * p_mag
+
+            m = mass_map.get(int(pt[i]), 0.13957)
+            # dk2nu stores momentum at decay but energy at production.
+            # Recompute the decay-point energy on shell.
+            E_decay = math.sqrt(p_mag * p_mag + m * m)
+
+            j = 0
+            data[i, j] = E_decay
+            j += 1
+            data[i, j] = px_det
+            j += 1
+            data[i, j] = py_det
+            j += 1
+            data[i, j] = pz_det
+            j += 1
+            data[i, j] = x_det[0]
+            j += 1
+            data[i, j] = x_det[1]
+            j += 1
+            data[i, j] = x_det[2]
+            j += 1
+            data[i, j] = m
+            j += 1
+            data[i, j] = weight[i]
+            j += 1
+
+            if t0 is not None:
+                data[i, j] = t0[i]
+                j += 1
+
+            if pol_chunk is not None:
+                data[i, j] = pol_chunk[local_i, 0]
+                data[i, j + 1] = pol_chunk[local_i, 1]
+                data[i, j + 2] = pol_chunk[local_i, 2]
+
+        # Drop references to the chunk temporaries before the next slice.
+        del pos_chunk
+        del mom_chunk
+        if pol_chunk is not None:
+            del pol_chunk
 
     if sampling_bias is not None:
         # The bias shapes the row selection only; the physical row weights
