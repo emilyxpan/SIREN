@@ -320,6 +320,7 @@ def read_dk2nu(
     read_polarization=True,
     entry_start=None,
     entry_stop=None,
+    num_files=None,
 ):
     """
     Read parent meson kinematics from one or more dk2nu ROOT files.
@@ -352,6 +353,9 @@ def read_dk2nu(
         downstream as unpolarized.
     entry_start, entry_stop : int, optional
         Limit the number of entries read (per file).
+    num_files : int, optional
+        Maximum number of files to read, taken from the start of
+        ``filenames``.  Default: read all supplied files.
 
     Returns
     -------
@@ -378,6 +382,15 @@ def read_dk2nu(
 
     if isinstance(filenames, str):
         filenames = [filenames]
+    
+    if num_files is not None:
+        if isinstance(num_files, (bool, np.bool_)) or not isinstance(
+            num_files, (int, np.integer)
+        ):
+            raise TypeError("num_files must be a non-negative integer or None")
+        if num_files < 0:
+            raise ValueError("num_files must be non-negative")
+        filenames = filenames[:num_files]
 
     def _as_list(value):
         if value is None:
