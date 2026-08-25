@@ -42,6 +42,7 @@ from .errors import ConfigurationError
 from .math import Vector3D
 
 from tqdm import tqdm
+import os
 
 
 # PDG codes for parent mesons
@@ -641,6 +642,8 @@ def dk2nu_to_primary_distribution(
     parent_pdg=None,
     sampling_bias=None,
     frame=None,
+    transformed_cache=None,
+    rebuild_transformed_cache=False,
 ):
     """
     Build a PrimaryExternalDistribution directly from dk2nu data.
@@ -747,10 +750,7 @@ def dk2nu_to_primary_distribution(
     n_bad = int(np.count_nonzero(bad))
 
     if n_bad:
-        print(
-            f"  found {n_bad} row(s) with negative or non-finite nimpwt",
-            flush=True,
-        )
+        print(f"  found {n_bad} row(s) with negative or non-finite nimpwt", flush=True,)
 
         if mask is None:
             mask = ~bad
@@ -836,128 +836,178 @@ def dk2nu_to_primary_distribution(
         keys += ["pol_x", "pol_y", "pol_z"]
 
     n_rows = len(E)
-    data = np.empty((n_rows, len(keys)), dtype=np.float64)
+    expected_shape = (n_rows, len(keys))
 
-    # 250k rows means each float64 (N, 3) temporary is about 6 MB.
-    # Increase this for more speed or decrease it if memory is still tight.
-    transform_chunk_size = 250_000
-    n_chunks = (n_rows + transform_chunk_size - 1) // transform_chunk_size
+    cache_exists = (transformed_cache is not None and os.path.exists(transformed_cache) and not rebuild_transformed_cache)
 
-    for chunk_idx, start in enumerate(
-            range(0, n_rows, transform_chunk_size), start=1):
-        stop = min(start + transform_chunk_size, n_rows)
+    if cache_exists:
+        print(f"Loading transformed dk2nu rows from {transformed_cache}", flush=True,)
 
-        # Materialize only this slice of positions and momenta.
-        pos_chunk = np.column_stack((
-            vx[start:stop],
-            vy[start:stop],
-            vz[start:stop],
-        )).astype(np.float64, copy=False)
-        pos_chunk *= 0.01  # cm -> m
+        data = np.load(transformed_cache, mmap_mode="r", allow_pickle=False,)
 
-        mom_chunk = np.column_stack((
-            px[start:stop],
-            py[start:stop],
-            pz[start:stop],
-        )).astype(np.float64, copy=False)
-
-        # Apply the rigid file-frame transform only to this chunk.
-        pos_chunk = (
-            pos_chunk @ xform.rotation.T
-            + xform.translation
-        )
-        mom_chunk = mom_chunk @ xform.rotation.T
-
-        # Polarization is normally absent for the pion sample used by this
-        # script. If present, transform only the matching slice here rather
-        # than creating another transformed full-size array.
-        if pol is not None:
-            pol_chunk = pol[start:stop] @ xform.rotation.T
-        else:
-            pol_chunk = None
-
-        if chunk_idx == 1 or chunk_idx % 10 == 0 or chunk_idx == n_chunks:
-            print(
-                "  transforming dk2nu rows %d-%d / %d (%.1f%%)"
-                % (start, stop, n_rows, 100.0 * stop / n_rows),
-                flush=True,
+        if data.shape != expected_shape:
+            raise RuntimeError(
+                f"Transformed cache has shape {data.shape}; "
+                f"expected {expected_shape}. Rebuild the cache."
             )
 
-        for local_i in range(stop - start):
-            i = start + local_i
+    else:
+        if transformed_cache is not None:
+            os.makedirs(
+                os.path.dirname(os.path.abspath(transformed_cache)),
+                exist_ok=True,
+            )
 
-            # Convert position from geometry to detector coordinates, unless
-            # the frame transform already landed in detector coordinates.
-            if to_detector:
-                x_det = (
-                    float(pos_chunk[local_i, 0]),
-                    float(pos_chunk[local_i, 1]),
-                    float(pos_chunk[local_i, 2]),
+            temporary_cache = transformed_cache + ".tmp"
+
+            # Write the transformed table directly to disk instead of allocating
+            # the entire table in RAM.
+            data = np.lib.format.open_memmap(
+                temporary_cache,
+                mode="w+",
+                dtype=np.float64,
+                shape=expected_shape,
+            )
+        else:
+            data = np.empty(expected_shape, dtype=np.float64)
+
+        # 250k rows means each float64 (N, 3) temporary is about 6 MB.
+        # Increase this for more speed or decrease it if memory is still tight.
+        transform_chunk_size = 250_000
+        n_chunks = (n_rows + transform_chunk_size - 1) // transform_chunk_size
+
+        for chunk_idx, start in enumerate(
+                range(0, n_rows, transform_chunk_size), start=1):
+            stop = min(start + transform_chunk_size, n_rows)
+
+            # Materialize only this slice of positions and momenta.
+            pos_chunk = np.column_stack((
+                vx[start:stop],
+                vy[start:stop],
+                vz[start:stop],
+            )).astype(np.float64, copy=False)
+            pos_chunk *= 0.01  # cm -> m
+
+            mom_chunk = np.column_stack((
+                px[start:stop],
+                py[start:stop],
+                pz[start:stop],
+            )).astype(np.float64, copy=False)
+
+            # Apply the rigid file-frame transform only to this chunk.
+            pos_chunk = (
+                pos_chunk @ xform.rotation.T
+                + xform.translation
+            )
+            mom_chunk = mom_chunk @ xform.rotation.T
+
+            # Polarization is normally absent for the pion sample used by this
+            # script. If present, transform only the matching slice here rather
+            # than creating another transformed full-size array.
+            if pol is not None:
+                pol_chunk = pol[start:stop] @ xform.rotation.T
+            else:
+                pol_chunk = None
+
+            if chunk_idx == 1 or chunk_idx % 10 == 0 or chunk_idx == n_chunks:
+                print(
+                    "  transforming dk2nu rows %d-%d / %d (%.1f%%)"
+                    % (start, stop, n_rows, 100.0 * stop / n_rows),
+                    flush=True,
                 )
-            else:
-                geo_pos = GeometryPosition(Vector3D(*pos_chunk[local_i]))
-                det_pos = detector_model.GeoPositionToDetPosition(geo_pos).get()
-                x_det = (det_pos.GetX(), det_pos.GetY(), det_pos.GetZ())
 
-            # Convert momentum direction from geometry to detector coordinates.
-            p0 = float(mom_chunk[local_i, 0])
-            p1 = float(mom_chunk[local_i, 1])
-            p2 = float(mom_chunk[local_i, 2])
-            p_mag = math.sqrt(p0 * p0 + p1 * p1 + p2 * p2)
+            for local_i in range(stop - start):
+                i = start + local_i
 
-            if to_detector or p_mag == 0.0:
-                px_det, py_det, pz_det = p0, p1, p2
-            else:
-                geo_dir = GeometryDirection(Vector3D(
-                    p0 / p_mag,
-                    p1 / p_mag,
-                    p2 / p_mag,
-                ))
-                det_dir = detector_model.GeoDirectionToDetDirection(geo_dir).get()
-                px_det = det_dir.GetX() * p_mag
-                py_det = det_dir.GetY() * p_mag
-                pz_det = det_dir.GetZ() * p_mag
+                # Convert position from geometry to detector coordinates, unless
+                # the frame transform already landed in detector coordinates.
+                if to_detector:
+                    x_det = (
+                        float(pos_chunk[local_i, 0]),
+                        float(pos_chunk[local_i, 1]),
+                        float(pos_chunk[local_i, 2]),
+                    )
+                else:
+                    geo_pos = GeometryPosition(Vector3D(*pos_chunk[local_i]))
+                    det_pos = detector_model.GeoPositionToDetPosition(geo_pos).get()
+                    x_det = (det_pos.GetX(), det_pos.GetY(), det_pos.GetZ())
 
-            m = mass_map.get(int(pt[i]), 0.13957)
-            # dk2nu stores momentum at decay but energy at production.
-            # Recompute the decay-point energy on shell.
-            E_decay = math.sqrt(p_mag * p_mag + m * m)
+                # Convert momentum direction from geometry to detector coordinates.
+                p0 = float(mom_chunk[local_i, 0])
+                p1 = float(mom_chunk[local_i, 1])
+                p2 = float(mom_chunk[local_i, 2])
+                p_mag = math.sqrt(p0 * p0 + p1 * p1 + p2 * p2)
 
-            j = 0
-            data[i, j] = E_decay
-            j += 1
-            data[i, j] = px_det
-            j += 1
-            data[i, j] = py_det
-            j += 1
-            data[i, j] = pz_det
-            j += 1
-            data[i, j] = x_det[0]
-            j += 1
-            data[i, j] = x_det[1]
-            j += 1
-            data[i, j] = x_det[2]
-            j += 1
-            data[i, j] = m
-            j += 1
-            data[i, j] = weight[i]
-            j += 1
+                if to_detector or p_mag == 0.0:
+                    px_det, py_det, pz_det = p0, p1, p2
+                else:
+                    geo_dir = GeometryDirection(Vector3D(
+                        p0 / p_mag,
+                        p1 / p_mag,
+                        p2 / p_mag,
+                    ))
+                    det_dir = detector_model.GeoDirectionToDetDirection(geo_dir).get()
+                    px_det = det_dir.GetX() * p_mag
+                    py_det = det_dir.GetY() * p_mag
+                    pz_det = det_dir.GetZ() * p_mag
 
-            if t0 is not None:
-                data[i, j] = t0[i]
+                m = mass_map.get(int(pt[i]), 0.13957)
+                # dk2nu stores momentum at decay but energy at production.
+                # Recompute the decay-point energy on shell.
+                E_decay = math.sqrt(p_mag * p_mag + m * m)
+
+                j = 0
+                data[i, j] = E_decay
+                j += 1
+                data[i, j] = px_det
+                j += 1
+                data[i, j] = py_det
+                j += 1
+                data[i, j] = pz_det
+                j += 1
+                data[i, j] = x_det[0]
+                j += 1
+                data[i, j] = x_det[1]
+                j += 1
+                data[i, j] = x_det[2]
+                j += 1
+                data[i, j] = m
+                j += 1
+                data[i, j] = weight[i]
                 j += 1
 
+                if t0 is not None:
+                    data[i, j] = t0[i]
+                    j += 1
+
+                if pol_chunk is not None:
+                    data[i, j] = pol_chunk[local_i, 0]
+                    data[i, j + 1] = pol_chunk[local_i, 1]
+                    data[i, j + 2] = pol_chunk[local_i, 2]
+
+            # Drop references to the chunk temporaries before the next slice.
+            del pos_chunk
+            del mom_chunk
             if pol_chunk is not None:
-                data[i, j] = pol_chunk[local_i, 0]
-                data[i, j + 1] = pol_chunk[local_i, 1]
-                data[i, j + 2] = pol_chunk[local_i, 2]
+                del pol_chunk
+                
+        if transformed_cache is not None:
+            data.flush()
+            del data
 
-        # Drop references to the chunk temporaries before the next slice.
-        del pos_chunk
-        del mom_chunk
-        if pol_chunk is not None:
-            del pol_chunk
+            os.replace(temporary_cache, transformed_cache)
 
+            data = np.load(
+                transformed_cache,
+                mmap_mode="r",
+                allow_pickle=False,
+            )
+
+            print(
+                f"Saved transformed dk2nu rows to {transformed_cache}",
+                flush=True,
+            )
+    
     if sampling_bias is not None:
         # The bias shapes the row selection only; the physical row weights
         # (nimpwt/POT, already in the table) de-bias it through the
