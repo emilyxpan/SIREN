@@ -1293,7 +1293,11 @@ def SaveEvents(events,
                fid_vol=None,
                injector=None,
                output_filename=None,
-               pot=None):
+               pot=None,
+               event_weights=None):
+    """Save events, optionally reusing precomputed weights.
+    - ``event_weights``: these values are used for the weights and ``weighter`` is not evaluated
+    """
 
     # pot is recorded only as an HDF5 attribute; accepting it while HDF5
     # output is disabled would drop it silently.
@@ -1313,6 +1317,20 @@ def SaveEvents(events,
     # supplies (a plain list of floats, one per event).
     if gen_times is None:
         gen_times = [0.0] * len(events)
+        
+    # Results.save supplies the weights calculated during generation here.
+    # Validate them before writing any file so a bad length cannot leave a
+    # partially written output set.
+    precomputed_cv = None
+    if event_weights is not None:
+        try:
+            precomputed_cv = [float(w) for w in event_weights]
+        except TypeError:
+            raise TypeError("event_weights must be a sequence of numbers")
+        if len(precomputed_cv) != len(events):
+            raise ValueError(
+                "event_weights sequence length %d != number of events %d"
+                % (len(precomputed_cv), len(events)))
 
     # Resolve the HepMC3 weight policy up front so per-event central values are
     # computed exactly once (BEFORE any file is written) and shared by the native
@@ -1321,9 +1339,14 @@ def SaveEvents(events,
     # the event_weight column so the CV is never recomputed.
     hepmc3_cv = None
     hepmc3_state = "unweighted"
-    if save_hepmc3 or save_siren_events:
-        hepmc3_cv, hepmc3_state = resolve_hepmc3_weight_policy(
-            events, hepmc3_weights, weighter)
+    if precomputed_cv is not None:
+        hepmc3_cv = precomputed_cv
+        hepmc3_state = "computed"
+        if save_hepmc3 or save_siren_events:
+            for tree, w in zip(events, hepmc3_cv):
+                _set_header_cv(tree, w)
+    elif save_hepmc3 or save_siren_events:
+        hepmc3_cv, hepmc3_state = resolve_hepmc3_weight_policy(events, hepmc3_weights, weighter)
 
     # Optionally save things. Headers are already populated (when the policy chose
     # to) so the native .siren_events file carries the same CV as the HepMC3 file.

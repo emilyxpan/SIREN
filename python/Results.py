@@ -192,12 +192,15 @@ class Results:
             Additional keyword arguments forwarded to
             :func:`siren._util.SaveEvents`.
         """
+        if "event_weights" in kwargs:
+            raise TypeError("Results.save() uses its stored weights; do not pass ""event_weights")
         _SaveEvents(
             self.events,
             self._weighter,
             self.gen_times,
             output_filename=path,
             pot=pot,
+            event_weights=self._weights,
             **kwargs,
         )
 
