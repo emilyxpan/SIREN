@@ -21,6 +21,11 @@ from DarkNews import phase_space
 
 logger = logging.getLogger(__name__)
 
+# Internal return value used to distinguish a point outside the interpolation
+# grid's convex hull from other interpolation-table misses.  Physical cross
+# sections are nonnegative, so this cannot be confused with a model value.
+_OUTSIDE_INTERPOLATION_HULL = -2.0
+
 
 def _finite_nonnegative(value, quantity):
     """Return a physical scalar density, clipping numerical undershoots.
@@ -208,6 +213,8 @@ class PyDarkNewsCrossSection(DarkNewsCrossSection):
         #
         # returns:
         # 0 if we are not close enough to any points in the interpolation table
+        # -1 if interpolator fails
+        # -2 (_OUTSIDE_INTERPOLATION_HULL) if interpolator returns NaN outside its convex hull
         # otherwise, returns the desired interpolated value
 
         # First make sure we are configured
@@ -262,7 +269,7 @@ class PyDarkNewsCrossSection(DarkNewsCrossSection):
                     "%s cross-section interpolation has no support at %s; "
                     "using exact evaluation" % (mode, inputs)
                 )
-                return -1
+                return _OUTSIDE_INTERPOLATION_HULL
             return _finite_nonnegative(val, mode)
 
         UseSinglePoint, Interpolate, closest_idx = self._interpolation_flags(
@@ -278,7 +285,7 @@ class PyDarkNewsCrossSection(DarkNewsCrossSection):
             if hasattr(val, "item"):
                 val = val.item()
             if np.isnan(val):
-                return -1
+                return _OUTSIDE_INTERPOLATION_HULL
             return _finite_nonnegative(val, mode)
         else:
             return -1
@@ -315,7 +322,7 @@ class PyDarkNewsCrossSection(DarkNewsCrossSection):
                 new_diff_points.append((E, z, dxsec))
                 num_added_points += 1
                 z *= 1 + factor * self.interp_tolerance
-
+        
         if new_total_points:
             self.total_cross_section_table = np.vstack(
                 (self.total_cross_section_table, new_total_points)
@@ -463,10 +470,34 @@ class PyDarkNewsCrossSection(DarkNewsCrossSection):
             return val
 
         # If we have reached this block, we must compute the differential cross section using DarkNews
-        return _finite_nonnegative(
+        dxsec= _finite_nonnegative(
             self.ups_case.diff_xsec_Q2(energy, Q2),
             "differential exact evaluation",
         )
+        
+        # Retain an exact evaluation that was required because the requested
+        # (energy, z) point lay outside LinearNDInterpolator's convex hull.
+        # _redefine_interpolation_objects() also restores the table's E/z sort
+        # order before rebuilding the interpolator.
+        if val == _OUTSIDE_INTERPOLATION_HULL:
+            point = np.asarray([energy, z], dtype=float)
+            coordinates = self.differential_cross_section_table[:, :2]
+            already_saved = len(coordinates) > 0 and np.any(
+                np.all(np.isclose(coordinates, point, rtol=self.tolerance, atol=self.tolerance,), axis=1,)
+            )
+            if not already_saved:
+                self.differential_cross_section_table = np.vstack(
+                    (self.differential_cross_section_table, [[energy, z, dxsec]],)
+                )
+                self._redefine_interpolation_objects(diff=True)
+                logger.debug(
+                    "Added exact differential cross section at E=%g GeV, z=%g "
+                    "to the interpolation table",
+                    energy,
+                    z,
+                )
+
+        return dxsec
 
     def TargetMass(self, target_type):
         target_mass = self.ups_case.MA
