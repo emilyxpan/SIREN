@@ -250,6 +250,9 @@ struct SecondaryDecayRangePositionDistribution::DensityContext {
     std::vector<DepthSegment> segments;
     double log_normalization = -std::numeric_limits<double>::infinity();
     double log_envelope_normalization = -std::numeric_limits<double>::infinity();
+    // Set when the segments were discarded because the daughter's success
+    // probability is negligible everywhere the parent can interact.
+    bool daughter_unreachable = false;
 };
 
 SecondaryDecayRangePositionDistribution::
@@ -495,6 +498,37 @@ SecondaryDecayRangePositionDistribution::BuildDensityContext(
             log_envelope_weight, log_integral, true};
     };
 
+    // Before paying for the segment integrals, check that the daughter can
+    // reach the fiducial volume from somewhere the parent can interact.  The
+    // best daughter success over the candidate segments (same three sample
+    // points evaluate_segment uses) below exp(-700) means it cannot: for
+    // example a neutrino just above the daughter's production threshold whose
+    // only above-threshold target material lies upstream of the volume, while
+    // the daughter decays within microns.  The ray offers no usable path;
+    // treat it like a ray that misses the volume so the injection attempt
+    // fails and is skipped, rather than sampling among log-probabilities of
+    // order 1e12.
+    constexpr double log_success_floor = -700.0;
+    double best_log_success = -std::numeric_limits<double>::infinity();
+    bool any_candidate = false;
+    for(std::size_t i = 0; i + 1 < natural_edges.size(); ++i) {
+        double lower_depth = parent_depth_at(natural_edges[i]);
+        double upper_depth = parent_depth_at(natural_edges[i + 1]);
+        if(!(upper_depth > lower_depth)) {
+            continue;
+        }
+        any_candidate = true;
+        for(double depth : {lower_depth, 0.5 * (lower_depth + upper_depth), upper_depth}) {
+            best_log_success = std::max(
+                best_log_success,
+                LogDaughterSuccessProbability(*context, distance_at_parent_depth(depth)));
+        }
+    }
+    if(any_candidate && best_log_success < log_success_floor) {
+        context->daughter_unreachable = true;
+        return context;
+    }
+
     std::vector<DepthSegment> working_segments;
     for(std::size_t i = 0; i + 1 < natural_edges.size(); ++i) {
         double lower_depth = parent_depth_at(natural_edges[i]);
@@ -614,7 +648,10 @@ void SecondaryDecayRangePositionDistribution::SampleVertex(
     if(context->segments.empty()) {
         throw siren::utilities::InjectionFailure(
             siren::utilities::FailureReason::NoPathThroughVolume,
-            "No parent vertex can produce a daughter process in the fiducial volume");
+            context->daughter_unreachable
+                ? "Daughter cannot reach the fiducial volume from anywhere the "
+                  "parent can interact (success below exp(-700) along the ray)"
+                : "No parent vertex can produce a daughter process in the fiducial volume");
     }
 
     constexpr std::size_t maximum_attempts = 100000;
